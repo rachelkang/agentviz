@@ -11,6 +11,7 @@
 
 import fs from "fs";
 import path from "path";
+import { decodeMulti as msgpackDecodeMulti } from "@msgpack/msgpack";
 
 function decodeProjectDir(dirName) {
   return (dirName || "").replace(/^-/, "").replace(/-/g, "/");
@@ -149,16 +150,130 @@ function isPathInsideRoot(root, targetPath) {
   return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
+/**
+ * Return the VS Copilot session directories.
+ * On Windows: %LOCALAPPDATA%\Microsoft\VisualStudio\*\VSGitHubCopilot\copilot-chat\*\sessions
+ */
+export function getVisualStudioSessionRoots(homeDir) {
+  var roots = [];
+  if (process.platform !== "win32") return roots;
+  var localAppData = process.env.LOCALAPPDATA || path.join(homeDir, "AppData", "Local");
+  var vsRoot = path.join(localAppData, "Microsoft", "VisualStudio");
+  try {
+    fs.readdirSync(vsRoot).forEach(function (instanceDir) {
+      // VS instances look like 18.0_f0a129d4
+      if (!/^\d+\.\d+_/.test(instanceDir)) return;
+      var copilotChatDir = path.join(vsRoot, instanceDir, "VSGitHubCopilot", "copilot-chat");
+      try {
+        fs.readdirSync(copilotChatDir).forEach(function (profileDir) {
+          var sessionsDir = path.join(copilotChatDir, profileDir, "sessions");
+          try {
+            if (fs.statSync(sessionsDir).isDirectory()) roots.push(sessionsDir);
+          } catch (e) {}
+        });
+      } catch (e) {}
+    });
+  } catch (e) {}
+  return roots;
+}
+
+/**
+ * Read VS session header by decoding the MessagePack binary.
+ * Returns minimal metadata without parsing the full session.
+ */
+function readVSSessionPreview(filePath) {
+  try {
+    var buf = fs.readFileSync(filePath);
+    if (buf.length < 10) return null;
+    // MessagePack stream: first value is version (int), second is header (map)
+    // Decode items one at a time using offset tracking
+    var items = decodeMultiMsgpack(buf, 2);
+    if (items.length < 2) return null;
+    var header = items[1];
+    if (!header || typeof header !== "object") return null;
+
+    var agentName = null;
+    var agentService = null;
+    if (header.SelectedAgent) {
+      agentName = header.SelectedAgent.Name || null;
+      if (header.SelectedAgent.Service) {
+        agentService = header.SelectedAgent.Service.Name || null;
+      }
+    }
+    var userName = header.User && header.User.Name ? header.User.Name : null;
+    var sessionId = null;
+    if (Array.isArray(header.Id) && header.Id.length > 0 && typeof header.Id[0] === "string") {
+      sessionId = header.Id[0];
+    }
+
+    return {
+      name: header.Name || null,
+      sessionId: sessionId,
+      userName: userName,
+      agentName: agentName,
+      agentService: agentService,
+      conversationMode: header.ConversationMode || null,
+      timeCreated: header.TimeCreated || null,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Decode MessagePack binary into a JSON envelope for the client parser.
+ */
+function decodeVSSessionToJSON(filePath) {
+  var buf = fs.readFileSync(filePath);
+  var items = decodeMultiMsgpack(buf, 1000);
+  if (items.length < 2) return null;
+
+  var header = items[1];
+  var messages = [];
+  for (var i = 2; i < items.length; i++) {
+    messages.push(items[i]);
+  }
+
+  return {
+    _format: "visual-studio",
+    version: items[0],
+    header: header,
+    messages: messages,
+  };
+}
+
+/**
+ * Decode up to maxItems MessagePack values from a buffer.
+ */
+function decodeMultiMsgpack(buf, maxItems) {
+  var results = [];
+  var count = 0;
+  for (var val of msgpackDecodeMulti(buf)) {
+    results.push(val);
+    count++;
+    if (count >= maxItems) break;
+  }
+  return results;
+}
+
 export function isAllowedSessionPath(resolvedSessionPath, homeDir) {
   if (!homeDir) return false;
 
   if (isPathInsideRoot(path.join(homeDir, ".claude", "projects"), resolvedSessionPath)) return true;
   if (isPathInsideRoot(path.join(homeDir, ".copilot", "session-state"), resolvedSessionPath)) return true;
 
-  return getVSCodeStorageRoots(homeDir).some(function (root) {
+  // VS Code Chat sessions
+  var vscodeAllowed = getVSCodeStorageRoots(homeDir).some(function (root) {
     if (!isPathInsideRoot(root, resolvedSessionPath)) return false;
     var parts = path.relative(root, resolvedSessionPath).split(path.sep).filter(Boolean);
     return parts.length >= 3 && parts[1] === "chatSessions";
+  });
+  if (vscodeAllowed) return true;
+
+  // Visual Studio Copilot sessions
+  return getVisualStudioSessionRoots(homeDir).some(function (sessionsRoot) {
+    return isPathInsideRoot(sessionsRoot, resolvedSessionPath) ||
+      resolvedSessionPath === sessionsRoot;
   });
 }
 
@@ -278,6 +393,35 @@ export function handle(pathname, req, res, ctx) {
       } catch (e) {}
     });
 
+    // Visual Studio Copilot: %LOCALAPPDATA%\Microsoft\VisualStudio\*\VSGitHubCopilot\copilot-chat\*\sessions\*
+    var vsRoots = getVisualStudioSessionRoots(homeDir);
+    vsRoots.forEach(function (sessionsDir) {
+      try {
+        fs.readdirSync(sessionsDir).forEach(function (sessionFileName) {
+          var filePath = path.join(sessionsDir, sessionFileName);
+          try {
+            var stat = fs.statSync(filePath);
+            if (!stat.isFile() || stat.size < 50) return;
+
+            var preview = readVSSessionPreview(filePath);
+            var label = preview && preview.name ? preview.name : (preview && preview.agentName ? preview.agentName : sessionFileName.substring(0, 8));
+            results.push({
+              id: "visual-studio:" + sessionFileName,
+              path: filePath,
+              filename: sessionFileName,
+              file: preview && preview.name ? preview.name : sessionFileName,
+              summary: preview && preview.name ? preview.name : null,
+              project: preview && preview.agentName ? preview.agentName : "Visual Studio",
+              sessionId: preview && preview.sessionId ? preview.sessionId : sessionFileName,
+              format: "visual-studio",
+              size: stat.size,
+              mtime: stat.mtime.toISOString(),
+            });
+          } catch (e) {}
+        });
+      } catch (e) {}
+    });
+
     results.sort(function (a, b) { return new Date(b.mtime) - new Date(a.mtime); });
     res.writeHead(200);
     res.end(JSON.stringify(results.slice(0, 200)));
@@ -285,7 +429,6 @@ export function handle(pathname, req, res, ctx) {
   }
 
   if (pathname === "/api/session") {
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
     if (req.method !== "GET") { res.writeHead(405); res.end("Method not allowed"); return true; }
     var sessionPath = ctx.parsed.query.path;
     if (!sessionPath) { res.writeHead(400); res.end("Missing path"); return true; }
@@ -302,10 +445,30 @@ export function handle(pathname, req, res, ctx) {
     if (!isAllowedSessionPath(resolvedSessionPath, home)) {
       res.writeHead(403); res.end("Forbidden"); return true;
     }
+
+    // VS Copilot sessions: binary MessagePack files (no extension, UUID filenames)
+    var isVSSession = getVisualStudioSessionRoots(home).some(function (root) {
+      return isPathInsideRoot(root, resolvedSessionPath);
+    });
+    if (isVSSession) {
+      try {
+        var envelope = decodeVSSessionToJSON(resolvedSessionPath);
+        if (!envelope) { res.writeHead(500); res.end("Failed to decode session"); return true; }
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.writeHead(200);
+        res.end(JSON.stringify(envelope));
+      } catch (e) {
+        res.writeHead(500); res.end("Failed to decode session: " + e.message);
+      }
+      return true;
+    }
+
+    // Text-based session files (.jsonl, .json)
     if (!resolvedSessionPath.endsWith(".jsonl") && !resolvedSessionPath.endsWith(".json")) {
       res.writeHead(400); res.end("Only session files are served"); return true;
     }
     try {
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
       var sessionText = fs.readFileSync(resolvedSessionPath, "utf8");
       res.writeHead(200);
       res.end(sessionText);

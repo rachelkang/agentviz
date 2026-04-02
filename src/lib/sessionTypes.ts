@@ -7,7 +7,7 @@ export interface TokenUsage {
   cacheWrite?: number;
 }
 
-export type SessionFormat = "claude-code" | "copilot-cli" | "vscode-chat";
+export type SessionFormat = "claude-code" | "copilot-cli" | "vscode-chat" | "visual-studio";
 
 export interface ParseIssues {
   malformedLines: number;
